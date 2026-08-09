@@ -400,6 +400,168 @@ def unfreeze_account(conn, args):
 
 
 # ---------------------------------------------------------------------------
+# delete-account
+# ---------------------------------------------------------------------------
+
+def _account_delete_blockers(conn, account_id: str) -> list[dict]:
+    """Return every in-scope reason ``account_id`` cannot be deleted.
+
+    Evaluates ALL checks (never fail-fast) so callers can report every
+    blocker in a single response instead of forcing the user to fix issues
+    one at a time. Each blocker is ``{"code", "message", "detail"}``.
+
+    Codes:
+      - non_zero_balance: net GL balance (all-time, via
+        ``erpclaw_lib.gl_posting.get_account_balance``) is not exactly zero.
+        Compared as ``Decimal`` — never as a string or float.
+      - posted_gl_history: any ``gl_entry`` row exists for this account, even
+        cancelled ones. ``gl_entry`` is append-only/checksum-chained —
+        cancellation adds reversal rows, it does not erase history.
+      - posted_journal_history: a ``journal_entry_line`` references this
+        account whose parent ``journal_entry.status`` has reached
+        submitted/cancelled/amended.
+      - draft_journal_reference: a ``journal_entry_line`` references this
+        account whose parent ``journal_entry.status`` is still 'draft'. This
+        is NOT posted history, but it still holds a DB-level RESTRICT FK, so
+        it is reported separately with guidance to clear the draft first.
+      - child_accounts: one or more ``account`` rows have
+        ``parent_id = account_id`` (checked via ``parent_id`` only — ``lft``/
+        ``rgt`` are nullable and not used here), regardless of the child's
+        disabled/is_frozen status.
+
+    ``is_group = 1`` alone is never a blocker — an empty group account with
+    no children/balance/history must be deletable.
+    """
+    blockers: list[dict] = []
+    t_gl = Table("gl_entry")
+    t_jel = Table("journal_entry_line")
+    t_je = Table("journal_entry")
+    t_account = Table("account")
+
+    # 1. Non-zero balance — Decimal comparison only.
+    balance = _lib_get_account_balance(conn, account_id)
+    if Decimal(balance["balance"]) != Decimal("0"):
+        blockers.append({
+            "code": "non_zero_balance",
+            "message": f"account has a non-zero balance ({balance['balance']})",
+            "detail": {"balance": balance["balance"]},
+        })
+
+    # 2. Posted GL history — ANY gl_entry row, including is_cancelled=1 rows.
+    q_gl = (Q.from_(t_gl)
+            .select(fn.Count("*").as_("cnt"))
+            .where(t_gl.account_id == P()))
+    gl_count = conn.execute(q_gl.get_sql(), (account_id,)).fetchone()["cnt"]
+    if gl_count > 0:
+        blockers.append({
+            "code": "posted_gl_history",
+            "message": f"account has {gl_count} GL entry record(s) (including any cancelled) and cannot be deleted",
+            "detail": {"gl_entry_count": gl_count},
+        })
+
+    # 3. Posted journal history — parent status submitted/cancelled/amended.
+    q_posted = (Q.from_(t_jel)
+                .join(t_je).on(t_je.id == t_jel.journal_entry_id)
+                .select(fn.Count("*").as_("cnt"))
+                .where(t_jel.account_id == P())
+                .where(t_je.status.isin(["submitted", "cancelled", "amended"])))
+    posted_count = conn.execute(q_posted.get_sql(), (account_id,)).fetchone()["cnt"]
+    if posted_count > 0:
+        blockers.append({
+            "code": "posted_journal_history",
+            "message": f"account is referenced by {posted_count} posted journal entry line(s) and cannot be deleted",
+            "detail": {"journal_entry_line_count": posted_count},
+        })
+
+    # 4. Draft journal references — not posted, but a live RESTRICT FK.
+    q_draft = (Q.from_(t_jel)
+               .join(t_je).on(t_je.id == t_jel.journal_entry_id)
+               .select(fn.Count("*").as_("cnt"))
+               .where(t_jel.account_id == P())
+               .where(t_je.status == "draft"))
+    draft_count = conn.execute(q_draft.get_sql(), (account_id,)).fetchone()["cnt"]
+    if draft_count > 0:
+        blockers.append({
+            "code": "draft_journal_reference",
+            "message": (f"account is referenced by {draft_count} draft journal entry line(s) — "
+                        "delete or clear the draft journal entry/entries first, then retry"),
+            "detail": {"draft_journal_entry_line_count": draft_count},
+        })
+
+    # 5. Child accounts — parent_id only (lft/rgt are nullable), regardless
+    #    of the child's disabled/is_frozen status.
+    q_children = (Q.from_(t_account)
+                  .select(fn.Count("*").as_("cnt"))
+                  .where(t_account.parent_id == P()))
+    child_count = conn.execute(q_children.get_sql(), (account_id,)).fetchone()["cnt"]
+    if child_count > 0:
+        blockers.append({
+            "code": "child_accounts",
+            "message": f"account has {child_count} child account(s) and cannot be deleted",
+            "detail": {"child_account_count": child_count},
+        })
+
+    return blockers
+
+
+def delete_account(conn, args):
+    """Delete an account, refusing when it has a non-zero balance, posted GL/
+    journal history, or child accounts.
+
+    All in-scope blockers are reported together (never fail-fast on the
+    first one found) via ``_account_delete_blockers``. This guard runs
+    unconditionally inside this function — it is the only enforcement point,
+    since a direct invocation of this domain script bypasses the router's
+    ``--user-confirmed`` confirmation gate entirely.
+
+    There is no --force/--override flag for this action.
+    """
+    acct_id = args.account_id
+    if not acct_id:
+        err("--account-id is required")
+
+    t_account = Table("account")
+    q = Q.from_(t_account).select(t_account.star).where(t_account.id == P())
+    row = conn.execute(q.get_sql(), (acct_id,)).fetchone()
+    if not row:
+        err(f"Account {acct_id} not found",
+             suggestion="Use 'list accounts' to see available accounts.")
+    acct = row_to_dict(row)
+
+    # Belongs-to-company check: only enforced when a company was resolvable
+    # from --company-id/--company, mirroring the cross-company guard used by
+    # other multi-tenant-sensitive actions in this codebase.
+    if args.company_id or args.company_name:
+        company_id = resolve_company_id(conn, args.company_id, args.company_name)
+        if acct["company_id"] != company_id:
+            err(f"Account {acct_id} does not belong to company {company_id}")
+
+    blockers = _account_delete_blockers(conn, acct_id)
+    if blockers:
+        message = "Cannot delete account: " + "; ".join(b["message"] for b in blockers)
+        err(message)
+
+    # Safety net BENEATH the explicit pre-checks above: any of the ~20 other
+    # tables with a RESTRICT FK to account(id) not covered by the checks
+    # above still raises sqlite3.IntegrityError here. Never leak the raw
+    # exception text or any table/column name to the caller.
+    q_del = Q.from_(t_account).delete().where(t_account.id == P())
+    try:
+        conn.execute(q_del.get_sql(), (acct_id,))
+    except sqlite3.IntegrityError:
+        conn.rollback()
+        err("account is still referenced elsewhere and cannot be deleted")
+
+    audit(conn, "erpclaw-gl", "delete", "account", acct_id,
+           old_values={"name": acct["name"], "account_number": acct["account_number"],
+                       "root_type": acct["root_type"], "account_type": acct["account_type"],
+                       "company_id": acct["company_id"]})
+    conn.commit()
+
+    ok({"status": "deleted", "deleted": True, "account_id": acct_id})
+
+
+# ---------------------------------------------------------------------------
 # 8. post-gl-entries
 # ---------------------------------------------------------------------------
 
@@ -1869,6 +2031,7 @@ ACTIONS = {
     "get-account": get_account,
     "freeze-account": freeze_account,
     "unfreeze-account": unfreeze_account,
+    "delete-account": delete_account,
     "post-gl-entries": post_gl_entries,
     "reverse-gl-entries": reverse_gl_entries_action,
     "list-gl-entries": list_gl_entries,

@@ -125,17 +125,20 @@ Re-confirm a second time ONLY for the small destructive set, where a mistake is 
 | `import-master-key-from-backup` | Cross-machine restore: install master key from a backup taken on another machine |
 | `get-audit-log` / `get-schema-version` / `update-regional-settings` / `onboard` | System admin |
 
-### General Ledger (30)
+### General Ledger (32)
 | Action | Description |
 |--------|-------------|
 | `setup-chart-of-accounts` / `add-account` / `update-account` / `get-account` / `list-accounts` | Account CRUD |
 | `freeze-account` / `unfreeze-account` / `get-account-balance` / `check-gl-integrity` | Account management |
+| `delete-account` | Permanently deletes an account. Refuses (reporting every applicable reason together, not just the first) when the account has: a non-zero balance; any posted GL/journal-entry history (any `gl_entry` row ever posted for it, including cancelled ones, or any journal-entry line whose parent has reached submitted/cancelled/amended); or one or more child accounts. A journal-entry line still on a **draft** entry is reported as its own distinct condition ("clear the draft first") rather than as posted history, but it still blocks deletion. An empty `is_group` account with no balance/history/children is deletable — the group flag alone never blocks. There is no `--force`/override; the only way past a blocker is fixing the underlying condition (clear the balance/history, reassign or remove the children) or using `freeze-account`/disable instead of deleting. Gated as a `DANGEROUS_ACTIONS` entry — the router requires `--user-confirmed`. Accepts the standard optional `--company-id`/`--company` (cross-company deletion is rejected when one is supplied; if neither is supplied, no company check runs — same precedent as `freeze-account`/`unfreeze-account`). CLI-only in this release: not exposed in `UI.yaml` / no web UI trigger (see note below the table). |
 | `post-gl-entries` / `reverse-gl-entries` / `list-gl-entries` | GL posting |
 | `add-fiscal-year` / `list-fiscal-years` / `validate-period-close` / `close-fiscal-year` / `reopen-fiscal-year` | Fiscal year |
 | `add-cost-center` / `list-cost-centers` / `add-budget` / `list-budgets` | Cost centers & budgets |
 | `add-dimension` / `list-dimensions` / `update-dimension` / `deactivate-dimension` | Accounting dimensions (M6): register/inspect/update/retire the dimension keys (department, project, location, fund, etc.) that drive `gl_entry.dimensions_json` (enforced as GL validation step 13). **To make a posting reportable "by <dimension>", tag it at entry time with `--dimension-key/--dimension-value` on the journal/invoice/payment actions** — then report with `multi-dim-trial-balance` / `dimension-balance-report` (see Financial Reports). `deactivate-dimension` is blocked while recent live GL still references the key |
 | `seed-naming-series` / `next-series` / `revalue-foreign-balances` | Naming & FX revaluation |
 | `import-chart-of-accounts` / `import-opening-balances` | CSV import |
+
+> **`delete-account` is CLI-only by deliberate choice, not an oversight.** It has no `UI.yaml` entry and no web dashboard trigger in this release. This is a conscious v1 scope decision, not a gap to silently fill: the erpclaw-web frontend's relay (`api/skills/executor.py`) never passes `--user-confirmed` on any action it forwards, so `DANGEROUS_ACTIONS` gating (which `delete-account` relies on) is not currently enforceable through that surface, and permanent account deletion is not the kind of action to expose without that gate. Before adding a UI trigger for this action, the relay's confirmation handling needs its own design/security review — don't wire it up as a routine UI-parity task.
 
 ### Journal Entries (16)
 | Action | Description |

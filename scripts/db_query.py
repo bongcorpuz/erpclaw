@@ -142,6 +142,7 @@ ACTION_MAP = {
     "get-account": "erpclaw-gl",
     "freeze-account": "erpclaw-gl",
     "unfreeze-account": "erpclaw-gl",
+    "delete-account": "erpclaw-gl",
     "post-gl-entries": "erpclaw-gl",
     "reverse-gl-entries": "erpclaw-gl",
     "list-gl-entries": "erpclaw-gl",
@@ -744,6 +745,9 @@ DANGEROUS_ACTIONS = frozenset({
     # Journal lifecycle
     "submit-journal-entry", "cancel-journal-entry", "delete-journal-entry",
     "delete-recurring-template",
+    # GL — account deletion (irreversible; guarded by _account_delete_blockers
+    # inside erpclaw-gl regardless of this router-level gate)
+    "delete-account",
     # Payments
     "submit-payment", "cancel-payment", "delete-payment",
     # Tax
